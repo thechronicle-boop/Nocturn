@@ -1707,6 +1707,8 @@ let rotY = 0.4, rotX = -0.15;
 let targetRotY = rotY, targetRotX = rotX;
 let autoRotateSpeed = 0.0009;
 let dragMoved = false;
+let velY = 0, velX = 0;          // spin speed (radians per ms), used for the glide after you let go
+let lastMoveTime = 0;
 let pointerDownOnCanvas = false; // only treat a pointerup as a globe click if it actually started on the canvas
 
 let rotationPaused = false;
@@ -1714,18 +1716,30 @@ let rotationPaused = false;
 renderer.domElement.addEventListener('pointerdown', e=>{
   isDragging = true; dragMoved = false; pointerDownOnCanvas = true;
   prevX = e.clientX; prevY = e.clientY;
+  velY = 0; velX = 0; lastMoveTime = performance.now();
+  // grabbing stops the globe where it is, instead of letting it keep drifting
+  targetRotY = rotY; targetRotX = rotX;
   container.classList.add('dragging');
 });
 window.addEventListener('pointermove', e=>{
   if(!isDragging) return;
   const dx = e.clientX - prevX, dy = e.clientY - prevY;
   if(Math.abs(dx)+Math.abs(dy) > 3) dragMoved = true;
-  targetRotY += dx*0.005;
-  targetRotX += dy*0.005;
-  targetRotX = Math.max(-1.3, Math.min(1.3, targetRotX));
+  // move less per pixel when zoomed in, so close-up dragging isn't twitchy
+  const sens = 0.0045 * (camera.userData.dist/8.2);
+  const ddy = dx*sens, ddx = dy*sens;
+  targetRotY += ddy;
+  targetRotX = Math.max(-1.3, Math.min(1.3, targetRotX + ddx));
+  const t = performance.now(), dt = Math.max(1, t - lastMoveTime);
+  // smoothed speed of the drag, for the glide on release
+  velY = velY*0.6 + (ddy/dt)*0.4;
+  velX = velX*0.6 + (ddx/dt)*0.4;
+  lastMoveTime = t;
   prevX = e.clientX; prevY = e.clientY;
 });
 window.addEventListener('pointerup', e=>{
+  // if the pointer stopped before letting go, don't fling
+  if(performance.now() - lastMoveTime > 80){ velY = 0; velX = 0; }
   isDragging = false;
   container.classList.remove('dragging');
   // Bug fix: this used to fire on ANY pointerup anywhere on the page — including
@@ -1754,6 +1768,7 @@ playPauseBtn.addEventListener('click', ()=> setRotationPaused(!rotationPaused));
 
 const recenterBtn = document.getElementById('recenter-fab');
 recenterBtn.addEventListener('click', ()=>{
+  velY = 0; velX = 0;
   targetRotY = 0.4; targetRotX = -0.15;
   camera.userData.dist = 8.2;
 });
@@ -2400,6 +2415,7 @@ function updateCountdowns(){
 
 let focusTarget = null;
 function focusOnLatLon(lat, lon){
+  velY = 0; velX = 0;
   targetRotY = -((lon+180)*Math.PI/180) + Math.PI*0.5;
   targetRotX = -lat*Math.PI/180*0.35;
 }
@@ -2443,20 +2459,36 @@ function updateMarkerPositions(){
 // Cap the render loop at 30fps. The globe's rotation is slow and ambient —
 // nothing about it needs 60-120 redraws a second, and this alone removes
 // most of the sustained GPU load (and the heat that comes with it).
-const FRAME_INTERVAL = 1000/30;
+const FRAME_INTERVAL = 1000/30;        // idle: 30fps to save battery
+const FRAME_INTERVAL_ACTIVE = 1000/120; // while dragging/gliding: full screen refresh rate
 let lastFrameTime = 0;
+let prevAnimTime = 0;
 let rafHandle = null;
 let pageVisible = !document.hidden;
 
 function animate(now){
   rafHandle = requestAnimationFrame(animate);
 
-  if(now - lastFrameTime < FRAME_INTERVAL) return;
+  const moving = isDragging || Math.abs(velY)+Math.abs(velX) > 1e-6 ||
+                 Math.abs(targetRotY-rotY)+Math.abs(targetRotX-rotX) > 0.0005;
+  if(now - lastFrameTime < (moving ? FRAME_INTERVAL_ACTIVE : FRAME_INTERVAL)) return;
   lastFrameTime = now;
+  const dt = Math.min(64, prevAnimTime ? now - prevAnimTime : 16.7);
+  prevAnimTime = now;
 
-  if(!isDragging && !rotationPaused){ targetRotY += autoRotateSpeed; }
-  rotY += (targetRotY-rotY)*0.08;
-  rotX += (targetRotX-rotX)*0.08;
+  // glide after release, slowing down smoothly
+  if(!isDragging && Math.abs(velY)+Math.abs(velX) > 1e-6){
+    targetRotY += velY*dt;
+    targetRotX = Math.max(-1.3, Math.min(1.3, targetRotX + velX*dt));
+    const decay = Math.pow(0.996, dt);
+    velY *= decay; velX *= decay;
+    if(Math.abs(velY)+Math.abs(velX) < 1e-6){ velY = 0; velX = 0; }
+  }
+  if(!isDragging && !rotationPaused){ targetRotY += autoRotateSpeed*(dt/33.3); }
+  // follow the target closely while dragging, a bit softer otherwise; same feel at any frame rate
+  const follow = 1 - Math.exp(-dt/(isDragging ? 28 : 90));
+  rotY += (targetRotY-rotY)*follow;
+  rotX += (targetRotX-rotX)*follow;
   world.rotation.y = rotY;
   world.rotation.x = rotX;
 
